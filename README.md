@@ -65,7 +65,7 @@ If you use these modules in your research, please cite the original work.
 
 This project is licensed under the MIT License.
 
-Copyright (c) \[Year] CrepuscularIRIS
+Copyright (c) \[2025] CrepuscularIRIS
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
