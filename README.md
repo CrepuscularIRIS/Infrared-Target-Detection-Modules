@@ -8,25 +8,25 @@ This repository contains PyTorch implementations of several novel modules design
 
 * **Principle:** MSGRA employs multi-scale Gaussian radial kernels to capture information at different spatial frequencies, enhancing the representation of small, bright targets.
 * **Analogy:** Similar to using multiple lenses with varying focal lengths to observe a night sky, MSGRA combines different levels of blur to effectively highlight small stars (targets).
-* **Code:** [module/MSGRA.py](module/MSGRA.py)
+* **Code:** \[module/MSGRA.py](module/MSGRA.py)
 
 ### 2.  AFBPE: Adaptive Fractional Biharmonic Position Encoding
 
 * **Principle:** AFBPE integrates fractional Laplacian and biharmonic operators to encode both edge details and broader structural information, improving target localization.
 * **Analogy:** AFBPE is comparable to analyzing terrain by considering both water permeation (fractional Laplacian) and the curvature of the land (biharmonic), allowing for a comprehensive understanding of the landscape.
-* **Code:** [module/AFB-PE.py](module/AFB-PE.py)
+* **Code:** \[module/AFB-PE.py](module/AFB-PE.py)
 
 ### 3.  ADRC: Adaptive Discrete-Ricci Curvature Position Encoding
 
 * **Principle:** ADRC approximates discrete Ollivier-Ricci curvature to differentiate between point-like targets (high curvature) and linear edges (low curvature), reducing false alarms.
 * **Analogy:** ADRC functions like a topographical map analysis tool, emphasizing peaks and diminishing the significance of ridges, effectively highlighting small, elevated features.
-* **Code:** [module/ADRC-PE.py](module/ADRC-PE.py)
+* **Code:** \[module/ADRC-PE.py](module/ADRC-PE.py)
 
 ### 4.  PHDE: Persistent Heat-Diffusion Encoding
 
 * **Principle:** PHDE simulates heat diffusion across feature maps and uses persistent homology to emphasize features that are stable over multiple scales, suppressing noise and enhancing small target representation.
 * **Analogy:** PHDE is similar to observing how heat dissipates across a metal plate; small hot spots cool quickly, while larger areas remain warm longer, helping to distinguish transient noise from significant structures.
-* **Code:** [module/PHDE.py](module/PHDE.py)
+* **Code:** \[module/PHDE.py](module/PHDE.py)
 
 ## Experimental Results
 
@@ -39,7 +39,7 @@ The effectiveness of these modules has been validated through experiments on the
 
 A detailed analysis of the results, including comparative performance metrics, can be found in the following document:
 
-* [module/python.md](module/python.md)
+* \[module/python.md](module/python.md)
 
 ## Performance Summary
 
@@ -63,4 +63,24 @@ If you use these modules in your research, please cite the original work.
 
 ## License
 
-This project is released under the \[Your License] license.
+This project is licensed under the MIT License.
+
+Copyright (c) \[Year] CrepuscularIRIS
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
