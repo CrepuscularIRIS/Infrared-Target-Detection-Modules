@@ -140,22 +140,21 @@ class BboxLoss(nn.Module):
 
 
 class GaussianBboxLoss(nn.Module):
-    """Criterion class for computing training losses for bounding boxes using Gaussian IoU."""
+    """Criterion class for computing training losses for bounding boxes using Gaussian-IoU."""
 
-    def __init__(self, reg_max: int = 16, k: float = 0.5, lam: float = 1.0):
+    def __init__(self, reg_max: int = 16, k: float = 0.3, lam: float = 0.5):
         """
-        Initialize the GaussianBboxLoss module with regularization maximum and Gaussian IoU settings.
+        Initialize the GaussianBboxLoss module with regularization maximum and Gaussian-IoU settings.
         
         Args:
             reg_max (int): Maximum value for DFL regularization.
-            k (float): Scale factor for Gaussian IoU sigma calculation.
-            lam (float): Weight factor for Gaussian center loss term.
+            k (float): Scale factor for Gaussian-IoU sigma calculation (lower for stability).
+            lam (float): Weight factor for Gaussian center loss term (lower for stability).
         """
         super().__init__()
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
         self.k = k
         self.lam = lam
-        self.warmup_epochs = 50  # 前50个epoch进行warmup
 
     def forward(
         self,
@@ -166,27 +165,161 @@ class GaussianBboxLoss(nn.Module):
         target_scores: torch.Tensor,
         target_scores_sum: torch.Tensor,
         fg_mask: torch.Tensor,
-        epoch: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute Gaussian IoU and DFL losses for bounding boxes."""
+        """Compute Gaussian-IoU and DFL losses for bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
         
-        # 渐进式λ调整：前50个epoch线性增长，之后保持恒定
-        if epoch < self.warmup_epochs:
-            current_lam = self.lam * (epoch / self.warmup_epochs)
+        # Calculate Gaussian-IoU loss
+        if fg_mask.sum() > 0:
+            pred_boxes_filtered = pred_bboxes[fg_mask]
+            target_boxes_filtered = target_bboxes[fg_mask]
+            gaussian_ious = self.gaussian_iou_calculation(pred_boxes_filtered, target_boxes_filtered)
+            loss_iou = ((1.0 - gaussian_ious) * weight.squeeze(-1)).sum() / target_scores_sum
         else:
-            current_lam = self.lam
+            loss_iou = torch.tensor(0.0, device=pred_dist.device, requires_grad=True)
+
+        # DFL loss
+        if self.dfl_loss:
+            target_ltrb = bbox2dist(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
+            loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
+            loss_dfl = loss_dfl.sum() / target_scores_sum
+        else:
+            loss_dfl = torch.tensor(0.0).to(pred_dist.device)
+
+        return loss_iou, loss_dfl
+
+    def gaussian_iou_calculation(self, pred, target, eps=1e-7):
+        """Calculate Gaussian IoU between predicted and target bboxes with enhanced stability."""
+        # Stability: clamp inputs to reasonable ranges
+        pred = torch.clamp(pred, min=-1000, max=1000)
+        target = torch.clamp(target, min=-1000, max=1000)
         
-        # Calculate Gaussian IoU
-        iou = bbox_iou(
-            pred_bboxes[fg_mask], 
-            target_bboxes[fg_mask], 
-            xywh=False, 
-            GaussianIoU=True, 
-            k=self.k, 
-            lam=current_lam
-        )
-        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+        # CIoU calculation first
+        # IoU calculation
+        lt = torch.max(pred[:, :2], target[:, :2])
+        rb = torch.min(pred[:, 2:], target[:, 2:])
+        wh = (rb - lt).clamp(min=0)
+        overlap = wh[:, 0] * wh[:, 1]
+
+        # Union with enhanced stability
+        ap = (pred[:, 2] - pred[:, 0]).clamp(min=eps) * (pred[:, 3] - pred[:, 1]).clamp(min=eps)
+        ag = (target[:, 2] - target[:, 0]).clamp(min=eps) * (target[:, 3] - target[:, 1]).clamp(min=eps)
+        union = ap + ag - overlap + eps
+
+        # IoU with stability check
+        ious = (overlap / union).clamp(min=0, max=1)
+
+        # Enclose area
+        enclose_x1y1 = torch.min(pred[:, :2], target[:, :2])
+        enclose_x2y2 = torch.max(pred[:, 2:], target[:, 2:])
+        enclose_wh = (enclose_x2y2 - enclose_x1y1).clamp(min=eps)
+
+        cw = enclose_wh[:, 0]
+        ch = enclose_wh[:, 1]
+        c2 = cw**2 + ch**2 + eps
+
+        b1_x1, b1_y1 = pred[:, 0], pred[:, 1]
+        b1_x2, b1_y2 = pred[:, 2], pred[:, 3]
+        b2_x1, b2_y1 = target[:, 0], target[:, 1]
+        b2_x2, b2_y2 = target[:, 2], target[:, 3]
+
+        w1, h1 = (b1_x2 - b1_x1).clamp(min=eps), (b1_y2 - b1_y1).clamp(min=eps)
+        w2, h2 = (b2_x2 - b2_x1).clamp(min=eps), (b2_y2 - b2_y1).clamp(min=eps)
+
+        # Center distance
+        left = ((b2_x1 + b2_x2) - (b1_x1 + b1_x2))**2 / 4
+        right = ((b2_y1 + b2_y2) - (b1_y1 + b1_y2))**2 / 4
+        rho2 = left + right
+
+        # Aspect ratio with stability
+        atan_w2h2 = torch.atan(w2 / h2)
+        atan_w1h1 = torch.atan(w1 / h1)
+        atan_diff = (atan_w2h2 - atan_w1h1).clamp(min=-1.5, max=1.5)  # clamp to avoid extreme values
+        
+        factor = 4 / (3.14159265359**2)
+        v = factor * torch.pow(atan_diff, 2)
+
+        # Alpha calculation with gradient isolation
+        with torch.no_grad():
+            alpha_cond = (ious > 0.5).float()
+            alpha_denom = (1 - ious + v + eps)
+            alpha = alpha_cond * v / alpha_denom
+
+        # CIoU with conservative penalty
+        rho2_c2 = (rho2 / c2).clamp(max=1.0)  # prevent excessive penalty
+        alpha_v = (alpha * v).clamp(max=0.5)  # limit aspect ratio penalty
+        cious = ious - rho2_c2 - alpha_v
+        
+        # Gaussian center loss component (enhanced stability)
+        # Calculate scale-adaptive sigma with stability bounds
+        wg = (target[:, 2] - target[:, 0]).clamp(min=eps)
+        hg = (target[:, 3] - target[:, 1]).clamp(min=eps)
+        
+        # More conservative sigma calculation
+        area_sqrt = torch.sqrt(wg * hg).clamp(min=0.01, max=10.0)  # prevent extreme sigmas
+        sigma = self.k * area_sqrt
+        
+        # Enhanced minimum sigma for numerical stability
+        min_sigma = 0.2  # increased for better stability
+        max_sigma = 5.0   # add maximum to prevent overshooting
+        sigma = torch.clamp(sigma, min=min_sigma, max=max_sigma)
+        
+        # Center distance with stability
+        center_distance = torch.sqrt(rho2 + eps)
+        
+        # Gaussian weight calculation with enhanced stability
+        exp_arg = -center_distance**2 / (2 * sigma**2 + eps)
+        exp_arg = torch.clamp(exp_arg, min=-10, max=0)  # prevent overflow/underflow
+        gaussian_weight = torch.exp(exp_arg)
+        
+        # Gaussian center loss (bounded and smooth)
+        center_loss = (1 - gaussian_weight).clamp(min=0, max=1)
+        
+        # Final Gaussian IoU with conservative weighting
+        # Apply gradual weighting to prevent training instability
+        lam_adaptive = self.lam * torch.clamp(ious, min=0.1, max=1.0)  # reduce penalty when IoU is very low
+        gaussian_ious = cious - lam_adaptive * center_loss
+        
+        # Final clamping for stability
+        return gaussian_ious.clamp(min=-0.8, max=1.0)  # less aggressive negative bound
+
+
+class SAFitBboxLoss(nn.Module):
+    """Criterion class for computing training losses for bounding boxes using SAFit loss."""
+
+    def __init__(self, reg_max: int = 16, C: float = 32):
+        """
+        Initialize the SAFitBboxLoss module with regularization maximum and SAFit settings.
+        
+        Args:
+            reg_max (int): Maximum value for DFL regularization.
+            C (float): Parameter for SAFit loss controlling the transition between IoU and NWD.
+        """
+        super().__init__()
+        self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
+        self.C = C
+
+    def forward(
+        self,
+        pred_dist: torch.Tensor,
+        pred_bboxes: torch.Tensor,
+        anchor_points: torch.Tensor,
+        target_bboxes: torch.Tensor,
+        target_scores: torch.Tensor,
+        target_scores_sum: torch.Tensor,
+        fg_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute SAFit and DFL losses for bounding boxes."""
+        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+        
+        # Calculate SAFit loss
+        if fg_mask.sum() > 0:
+            pred_boxes_filtered = pred_bboxes[fg_mask]
+            target_boxes_filtered = target_bboxes[fg_mask]
+            safit_losses = safit_loss(pred_boxes_filtered, target_boxes_filtered, C=self.C)
+            loss_iou = (safit_losses * weight.squeeze(-1)).sum() / target_scores_sum
+        else:
+            loss_iou = torch.tensor(0.0, device=pred_dist.device, requires_grad=True)
 
         # DFL loss
         if self.dfl_loss:
@@ -270,8 +403,8 @@ class v8DetectionLoss:
 
         self.use_dfl = m.reg_max > 1
 
-        self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
-        self.bbox_loss = GaussianBboxLoss(m.reg_max, k=0.3, lam=0.5).to(device)
+        self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.25, beta=3.0)
+        self.bbox_loss = GaussianBboxLoss(m.reg_max, k=0.58, lam=1.0).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
@@ -346,10 +479,8 @@ class v8DetectionLoss:
         # Bbox loss
         if fg_mask.sum():
             target_bboxes /= stride_tensor
-            # 获取当前epoch（如果batch中有epoch信息）
-            current_epoch = batch.get("epoch", 0)
             loss[0], loss[2] = self.bbox_loss(
-                pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask, current_epoch
+                pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask
             )
 
         loss[0] *= self.hyp.box  # box gain
@@ -910,3 +1041,378 @@ class TVPSegmentLoss(TVPDetectLoss):
         vp_loss = self.vp_criterion((vp_feats, pred_masks, proto), batch)
         cls_loss = vp_loss[0][2]
         return cls_loss, vp_loss[1]
+
+
+def xyxy2xyw2h2(boxes):
+    """Convert bounding boxes from (x1, y1, x2, y2) to (x, y, w, h) format."""
+    x1, y1, x2, y2 = boxes.unbind(-1)
+    w = x2 - x1
+    h = y2 - y1
+    x = x1 + w / 2
+    y = y1 + h / 2
+    return torch.stack([x, y, w, h], dim=-1)
+
+
+def sigmoid(x, C):
+    """Sigmoid function for SAFit loss."""
+    return 1 / (1 + torch.exp(-x / C))
+
+
+def bbox_overlaps(pred, target, is_aligned=True, eps=1e-6):
+    """Calculate IoU between predicted and target bboxes."""
+    if is_aligned:
+        lt = torch.max(pred[:, :2], target[:, :2])
+        rb = torch.min(pred[:, 2:], target[:, 2:])
+        wh = (rb - lt).clamp(min=0)
+        overlap = wh[:, 0] * wh[:, 1]
+        
+        ap = (pred[:, 2] - pred[:, 0]) * (pred[:, 3] - pred[:, 1])
+        ag = (target[:, 2] - target[:, 0]) * (target[:, 3] - target[:, 1])
+        union = ap + ag - overlap + eps
+        
+        return overlap / union
+    else:
+        # Not aligned case - implement if needed
+        raise NotImplementedError("Non-aligned bbox_overlaps not implemented")
+
+
+def safit_loss(pred, target, eps=1e-7, C=32):
+    """SAFit loss combining IoU and NWD for small object detection."""
+    # IoU calculation
+    ious = bbox_overlaps(pred, target, is_aligned=True).clamp(min=eps)
+    
+    # NWD calculation
+    pred_xyhw = xyxy2xyw2h2(pred)
+    target_xyhw = xyxy2xyw2h2(target)
+    nwd = torch.exp(-torch.sqrt(torch.sum((pred_xyhw - target_xyhw) * (pred_xyhw - target_xyhw), dim=1)) / C)
+ 
+    # SAFit calculation
+    ag = (target[:, 2] - target[:, 0]) * (target[:, 3] - target[:, 1])
+    area = ag
+    safit = sigmoid(torch.sqrt(area) - C, C) * ious + (1 - sigmoid(torch.sqrt(area) - C, C)) * nwd
+    loss = 1 - safit
+    return loss
+
+
+def nwd_loss(pred, target, eps=1e-7, C=32):
+    """NWD (Normalized Wasserstein Distance) loss for small object detection."""
+    # Convert to (x, y, w, h) format
+    pred_xyhw = xyxy2xyw2h2(pred)
+    target_xyhw = xyxy2xyw2h2(target)
+    
+    # Calculate NWD
+    nwd = torch.exp(-torch.norm((pred_xyhw - target_xyhw), p=2, dim=1) / C)
+    loss = 1 - nwd.clamp(min=eps, max=1.0)
+    return loss
+
+
+class NWDBboxLoss(nn.Module):
+    """Criterion class for computing training losses for bounding boxes using NWD loss."""
+
+    def __init__(self, reg_max: int = 16, C: float = 32):
+        """
+        Initialize the NWDBboxLoss module with regularization maximum and NWD settings.
+        
+        Args:
+            reg_max (int): Maximum value for DFL regularization.
+            C (float): Parameter for NWD loss controlling the sensitivity to distance.
+        """
+        super().__init__()
+        self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
+        self.C = C
+
+    def forward(
+        self,
+        pred_dist: torch.Tensor,
+        pred_bboxes: torch.Tensor,
+        anchor_points: torch.Tensor,
+        target_bboxes: torch.Tensor,
+        target_scores: torch.Tensor,
+        target_scores_sum: torch.Tensor,
+        fg_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute NWD and DFL losses for bounding boxes."""
+        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+        
+        # Calculate NWD loss
+        if fg_mask.sum() > 0:
+            pred_boxes_filtered = pred_bboxes[fg_mask]
+            target_boxes_filtered = target_bboxes[fg_mask]
+            nwd_losses = nwd_loss(pred_boxes_filtered, target_boxes_filtered, C=self.C)
+            loss_iou = (nwd_losses * weight.squeeze(-1)).sum() / target_scores_sum
+        else:
+            loss_iou = torch.tensor(0.0, device=pred_dist.device, requires_grad=True)
+
+        # DFL loss
+        if self.dfl_loss:
+            target_ltrb = bbox2dist(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
+            loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
+            loss_dfl = loss_dfl.sum() / target_scores_sum
+        else:
+            loss_dfl = torch.tensor(0.0).to(pred_dist.device)
+
+        return loss_iou, loss_dfl
+
+
+def ciou_calculation(pred, target, eps=1e-7):
+    """Calculate CIoU (Complete IoU) between predicted and target bboxes."""
+    # IoU calculation
+    lt = torch.max(pred[:, :2], target[:, :2])
+    rb = torch.min(pred[:, 2:], target[:, 2:])
+    wh = (rb - lt).clamp(min=0)
+    overlap = wh[:, 0] * wh[:, 1]
+
+    # Union
+    ap = (pred[:, 2] - pred[:, 0]) * (pred[:, 3] - pred[:, 1])
+    ag = (target[:, 2] - target[:, 0]) * (target[:, 3] - target[:, 1])
+    union = ap + ag - overlap + eps
+
+    # IoU
+    ious = overlap / union
+
+    # Enclose area
+    enclose_x1y1 = torch.min(pred[:, :2], target[:, :2])
+    enclose_x2y2 = torch.max(pred[:, 2:], target[:, 2:])
+    enclose_wh = (enclose_x2y2 - enclose_x1y1).clamp(min=0)
+
+    cw = enclose_wh[:, 0]
+    ch = enclose_wh[:, 1]
+    c2 = cw**2 + ch**2 + eps
+
+    b1_x1, b1_y1 = pred[:, 0], pred[:, 1]
+    b1_x2, b1_y2 = pred[:, 2], pred[:, 3]
+    b2_x1, b2_y1 = target[:, 0], target[:, 1]
+    b2_x2, b2_y2 = target[:, 2], target[:, 3]
+
+    w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1 + eps
+    w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1 + eps
+
+    # Center distance
+    left = ((b2_x1 + b2_x2) - (b1_x1 + b1_x2))**2 / 4
+    right = ((b2_y1 + b2_y2) - (b1_y1 + b1_y2))**2 / 4
+    rho2 = left + right
+
+    # Aspect ratio
+    factor = 4 / (3.14159265359**2)
+    v = factor * torch.pow(torch.atan(w2 / h2) - torch.atan(w1 / h1), 2)
+
+    with torch.no_grad():
+        alpha = (ious > 0.5).float() * v / (1 - ious + v)
+
+    # CIoU
+    cious = ious - (rho2 / c2 + alpha * v)
+    return cious.clamp(min=-1.0, max=1.0)
+
+
+def scfit_loss(pred, target, eps=1e-7, C=32):
+    """SCFit loss combining CIoU and NWD for enhanced small object detection."""
+    # CIoU calculation (instead of basic IoU)
+    cious = ciou_calculation(pred, target, eps=eps).clamp(min=eps)
+    
+    # NWD calculation
+    pred_xyhw = xyxy2xyw2h2(pred)
+    target_xyhw = xyxy2xyw2h2(target)
+    nwd = torch.exp(-torch.sqrt(torch.sum((pred_xyhw - target_xyhw) * (pred_xyhw - target_xyhw), dim=1)) / C)
+ 
+    # SCFit calculation with CIoU
+    ag = (target[:, 2] - target[:, 0]) * (target[:, 3] - target[:, 1])
+    area = ag
+    weight = sigmoid(torch.sqrt(area) - C, C)
+    scfit = weight * cious + (1 - weight) * nwd
+    loss = 1 - scfit
+    return loss
+
+
+class SCFitBboxLoss(nn.Module):
+    """Criterion class for computing training losses for bounding boxes using SCFit loss (SAFit with CIoU)."""
+
+    def __init__(self, reg_max: int = 16, C: float = 32):
+        """
+        Initialize the SCFitBboxLoss module with regularization maximum and SCFit settings.
+        
+        Args:
+            reg_max (int): Maximum value for DFL regularization.
+            C (float): Parameter for SCFit loss controlling the transition between CIoU and NWD.
+        """
+        super().__init__()
+        self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
+        self.C = C
+
+    def forward(
+        self,
+        pred_dist: torch.Tensor,
+        pred_bboxes: torch.Tensor,
+        anchor_points: torch.Tensor,
+        target_bboxes: torch.Tensor,
+        target_scores: torch.Tensor,
+        target_scores_sum: torch.Tensor,
+        fg_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute SCFit and DFL losses for bounding boxes."""
+        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+        
+        # Calculate SCFit loss
+        if fg_mask.sum() > 0:
+            pred_boxes_filtered = pred_bboxes[fg_mask]
+            target_boxes_filtered = target_bboxes[fg_mask]
+            scfit_losses = scfit_loss(pred_boxes_filtered, target_boxes_filtered, C=self.C)
+            loss_iou = (scfit_losses * weight.squeeze(-1)).sum() / target_scores_sum
+        else:
+            loss_iou = torch.tensor(0.0, device=pred_dist.device, requires_grad=True)
+
+        # DFL loss
+        if self.dfl_loss:
+            target_ltrb = bbox2dist(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
+            loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
+            loss_dfl = loss_dfl.sum() / target_scores_sum
+        else:
+            loss_dfl = torch.tensor(0.0).to(pred_dist.device)
+
+        return loss_iou, loss_dfl
+
+
+def gaussian_iou_calculation(pred, target, k=0.5, lam=1.0, eps=1e-7):
+    """Calculate Gaussian IoU between predicted and target bboxes."""
+    # CIoU calculation first
+    # IoU calculation
+    lt = torch.max(pred[:, :2], target[:, :2])
+    rb = torch.min(pred[:, 2:], target[:, 2:])
+    wh = (rb - lt).clamp(min=0)
+    overlap = wh[:, 0] * wh[:, 1]
+
+    # Union
+    ap = (pred[:, 2] - pred[:, 0]) * (pred[:, 3] - pred[:, 1])
+    ag = (target[:, 2] - target[:, 0]) * (target[:, 3] - target[:, 1])
+    union = ap + ag - overlap + eps
+
+    # IoU
+    ious = overlap / union
+
+    # Enclose area
+    enclose_x1y1 = torch.min(pred[:, :2], target[:, :2])
+    enclose_x2y2 = torch.max(pred[:, 2:], target[:, 2:])
+    enclose_wh = (enclose_x2y2 - enclose_x1y1).clamp(min=0)
+
+    cw = enclose_wh[:, 0]
+    ch = enclose_wh[:, 1]
+    c2 = cw**2 + ch**2 + eps
+
+    b1_x1, b1_y1 = pred[:, 0], pred[:, 1]
+    b1_x2, b1_y2 = pred[:, 2], pred[:, 3]
+    b2_x1, b2_y1 = target[:, 0], target[:, 1]
+    b2_x2, b2_y2 = target[:, 2], target[:, 3]
+
+    w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1 + eps
+    w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1 + eps
+
+    # Center distance
+    left = ((b2_x1 + b2_x2) - (b1_x1 + b1_x2))**2 / 4
+    right = ((b2_y1 + b2_y2) - (b1_y1 + b1_y2))**2 / 4
+    rho2 = left + right
+
+    # Aspect ratio
+    factor = 4 / (3.14159265359**2)
+    v = factor * torch.pow(torch.atan(w2 / h2) - torch.atan(w1 / h1), 2)
+
+    with torch.no_grad():
+        alpha = (ious > 0.5).float() * v / (1 - ious + v)
+
+    # CIoU
+    cious = ious - (rho2 / c2 + alpha * v)
+    
+    # Gaussian center loss component
+    # Calculate scale-adaptive sigma
+    wg = target[:, 2] - target[:, 0]  # target width
+    hg = target[:, 3] - target[:, 1]  # target height
+    sigma = k * torch.sqrt(wg * hg)  # scale-adaptive sigma
+    
+    # Center distance
+    center_distance = torch.sqrt(rho2)
+    
+    # Gaussian weight
+    gaussian_weight = torch.exp(-center_distance**2 / (2 * sigma**2 + eps))
+    
+    # Gaussian center loss (bounded form)
+    center_loss = 1 - gaussian_weight
+    
+    # Gaussian IoU = CIoU + λ * center_loss
+    gaussian_ious = cious - lam * center_loss
+    
+    return gaussian_ious.clamp(min=-1.0, max=1.0)
+
+
+def sgfit_loss(pred, target, eps=1e-7, C=32, k=0.5, lam=1.0):
+    """SGFit loss combining Gaussian-IoU and NWD for enhanced small object detection."""
+    # Gaussian-IoU calculation
+    gaussian_ious = gaussian_iou_calculation(pred, target, k=k, lam=lam, eps=eps).clamp(min=eps)
+    
+    # NWD calculation
+    pred_xyhw = xyxy2xyw2h2(pred)
+    target_xyhw = xyxy2xyw2h2(target)
+    nwd = torch.exp(-torch.sqrt(torch.sum((pred_xyhw - target_xyhw) * (pred_xyhw - target_xyhw), dim=1)) / C)
+ 
+    # SGFit calculation with Gaussian-IoU
+    ag = (target[:, 2] - target[:, 0]) * (target[:, 3] - target[:, 1])
+    area = ag
+    weight = sigmoid(torch.sqrt(area) - C, C)
+    sgfit = weight * gaussian_ious + (1 - weight) * nwd
+    loss = 1 - sgfit
+    return loss
+
+
+class SGFitBboxLoss(nn.Module):
+    """Criterion class for computing training losses for bounding boxes using SGFit loss (NWD + Gaussian-IoU)."""
+
+    def __init__(self, reg_max: int = 16, C: float = 32, k: float = 0.5, lam: float = 1.0):
+        """
+        Initialize the SGFitBboxLoss module with regularization maximum and SGFit settings.
+        
+        Args:
+            reg_max (int): Maximum value for DFL regularization.
+            C (float): Parameter for SGFit loss controlling the transition between Gaussian-IoU and NWD.
+            k (float): Scale factor for Gaussian-IoU sigma calculation.
+            lam (float): Weight factor for Gaussian center loss term.
+        """
+        super().__init__()
+        self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
+        self.C = C
+        self.k = k
+        self.lam = lam
+
+    def forward(
+        self,
+        pred_dist: torch.Tensor,
+        pred_bboxes: torch.Tensor,
+        anchor_points: torch.Tensor,
+        target_bboxes: torch.Tensor,
+        target_scores: torch.Tensor,
+        target_scores_sum: torch.Tensor,
+        fg_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute SGFit and DFL losses for bounding boxes."""
+        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+        
+        # Calculate SGFit loss
+        if fg_mask.sum() > 0:
+            pred_boxes_filtered = pred_bboxes[fg_mask]
+            target_boxes_filtered = target_bboxes[fg_mask]
+            sgfit_losses = sgfit_loss(
+                pred_boxes_filtered, 
+                target_boxes_filtered, 
+                C=self.C, 
+                k=self.k, 
+                lam=self.lam
+            )
+            loss_iou = (sgfit_losses * weight.squeeze(-1)).sum() / target_scores_sum
+        else:
+            loss_iou = torch.tensor(0.0, device=pred_dist.device, requires_grad=True)
+
+        # DFL loss
+        if self.dfl_loss:
+            target_ltrb = bbox2dist(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
+            loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
+            loss_dfl = loss_dfl.sum() / target_scores_sum
+        else:
+            loss_dfl = torch.tensor(0.0).to(pred_dist.device)
+
+        return loss_iou, loss_dfl
