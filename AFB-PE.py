@@ -43,30 +43,53 @@ class FractionalLaplacianKernel(nn.Module):
             torch.Tensor: The computed kernel weights of shape (1, 1, k, k).
         """
         # Ensure alpha is positive and numerically stable
-        stable_alpha = F.softplus(alpha) # softplus(x) = log(1 + exp(x))
+        stable_alpha = F.softplus(alpha).clamp(min=0.1, max=2.0)  # 限制范围防止极值
 
         # Dimension d=2 for 2D images
         dim = 2
         exponent = -(dim + 2 * stable_alpha)
 
-        # Calculate distance, add epsilon before power calculation
-        dist = torch.sqrt(self.squared_dist) + 1e-9 # Add epsilon here
+        # Calculate distance with better numerical stability
+        dist = torch.sqrt(self.squared_dist + 1e-12) + 1e-8  # 双重保护
 
-        # Calculate weights for neighbors (where dist > 0)
-        # Use torch.pow for fractional exponentiation
-        neighbor_weights = torch.pow(dist, exponent)
+        # Calculate weights for neighbors with numerical stability
+        # 使用log-exp技巧避免直接的负指数幂运算
+        log_dist = torch.log(dist + 1e-12)
+        log_weights = exponent * log_dist
+        # 限制log权重范围防止溢出
+        log_weights = torch.clamp(log_weights, min=-20, max=5)
+        neighbor_weights = torch.exp(log_weights)
+
+        # 检查并处理可能的NaN或inf
+        neighbor_weights = torch.where(
+            torch.isfinite(neighbor_weights), 
+            neighbor_weights, 
+            torch.zeros_like(neighbor_weights)
+        )
 
         # Mask out the center pixel's contribution from the neighbor calculation
         neighbor_weights = neighbor_weights * (1.0 - self.identity_mask)
 
         # Set the center weight such that the sum of all weights is zero
         center_weight = -torch.sum(neighbor_weights)
+        
+        # 确保center_weight是有限的
+        center_weight = torch.where(
+            torch.isfinite(center_weight),
+            center_weight,
+            torch.tensor(-1.0, device=center_weight.device, dtype=center_weight.dtype)
+        )
 
         # Combine center and neighbor weights
         kernel = neighbor_weights + center_weight * self.identity_mask
 
-        # Normalize? Optional, classic Laplacian doesn't normalize this way.
-        # kernel = kernel / (-center_weight) # Example normalization if needed
+        # 最终检查并归一化
+        kernel = torch.where(torch.isfinite(kernel), kernel, torch.zeros_like(kernel))
+        
+        # 简单归一化确保数值稳定
+        kernel_abs_sum = torch.abs(kernel).sum()
+        if kernel_abs_sum > 1e-12:
+            kernel = kernel / kernel_abs_sum * 4.0  # 简单的归一化
 
         # Return kernel in the required shape (1, 1, k, k) for depthwise conv weight
         return kernel.unsqueeze(0).unsqueeze(0)
@@ -74,8 +97,8 @@ class FractionalLaplacianKernel(nn.Module):
 # Helper Module for Fixed Depthwise Laplacian
 class DepthwiseLaplacian(nn.Module):
     """
-    Applies a fixed depthwise Laplacian convolution.
-    Uses the standard 3x3 Laplacian kernel [-1,-1,-1; -1,8,-1; -1,-1,-1]
+    Applies a fixed depthwise Laplacian convolution using F.conv2d and buffer.
+    Uses the standard 3x3 Laplacian kernel [0,1,0; 1,-4,1; 0,1,0]
     centered within a kxk kernel if k > 3.
     """
     def __init__(self, channels: int, k: int):
@@ -84,12 +107,13 @@ class DepthwiseLaplacian(nn.Module):
             raise ValueError(f"Kernel size k must be odd, but got {k}")
         self.k = k
         self.channels = channels
+        self.padding = k // 2
 
-        # Define the standard 3x3 Laplacian kernel
+        # Define the standard 3x3 Laplacian kernel (simpler version)
         laplacian_kernel_3x3 = torch.tensor([
-            [-1., -1., -1.],
-            [-1.,  8., -1.],
-            [-1., -1., -1.]
+            [0., 1., 0.],
+            [1., -4., 1.],
+            [0., 1., 0.]
         ], dtype=torch.float32)
 
         # Create the target kxk kernel, initialized to zeros
@@ -107,15 +131,12 @@ class DepthwiseLaplacian(nn.Module):
         # Expand kernel to depthwise shape: (channels, 1, k, k)
         depthwise_kernel = kernel_kxk.unsqueeze(0).unsqueeze(0).repeat(channels, 1, 1, 1)
 
-        # Create the depthwise convolution layer
-        self.dw_conv = nn.Conv2d(channels, channels, kernel_size=k,
-                                 padding=k // 2, groups=channels, bias=False)
-
-        # Set the fixed weights and make them non-trainable
-        self.dw_conv.weight = nn.Parameter(depthwise_kernel, requires_grad=False)
+        # Register as buffer (non-trainable)
+        self.register_buffer('laplacian_weight', depthwise_kernel)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.dw_conv(x)
+        return F.conv2d(x, self.laplacian_weight, bias=None, 
+                       padding=self.padding, groups=self.channels)
 
 # Main AFB-PE Module
 class AFBPE(nn.Module):
@@ -184,34 +205,100 @@ class AFBPE(nn.Module):
         if C != self.channels:
              raise ValueError(f"Input channels {C} mismatch module channels {self.channels}")
 
+        # 数值稳定性检查
+        if not torch.isfinite(x).all():
+            print("Warning: Non-finite input detected in AFBPE")
+            x = torch.where(torch.isfinite(x), x, torch.zeros_like(x))
+
         # --- Channel Reduction ---
         y = self.reduce(x) # Shape: (B, cr, H, W)
+        
+        # 检查channel reduction后的数值
+        if not torch.isfinite(y).all():
+            print("Warning: Non-finite values after channel reduction in AFBPE")
+            y = torch.where(torch.isfinite(y), y, torch.zeros_like(y))
 
         # --- Fractional Laplacian Response (u1) ---
         # Compute kernel weights based on current alpha
         # Note: Computation happens on the device where alpha resides
-        frac_kernel_weights = self.frac_kernel_computer(self.alpha) # Shape: (1, 1, k, k)
-        # Set weights dynamically for the depthwise convolution layer
-        # Repeat weights for each input channel (group)
-        self.dw_frac.weight.data = frac_kernel_weights.repeat(self.cr, 1, 1, 1)
-        # Apply depthwise fractional laplacian
-        u1 = self.dw_frac(y) # Shape: (B, cr, H, W)
+        try:
+            frac_kernel_weights = self.frac_kernel_computer(self.alpha) # Shape: (1, 1, k, k)
+            
+            # 检查kernel weights的有效性
+            if not torch.isfinite(frac_kernel_weights).all():
+                print("Warning: Non-finite kernel weights in AFBPE, using fallback")
+                # 使用简单的Laplacian kernel作为fallback
+                fallback_kernel = torch.tensor([[0., -1., 0.], [-1., 4., -1.], [0., -1., 0.]], 
+                                             device=frac_kernel_weights.device, 
+                                             dtype=frac_kernel_weights.dtype).view(1, 1, 3, 3)
+                if self.k > 3:
+                    # 如果kernel size大于3，需要padding
+                    pad_size = (self.k - 3) // 2
+                    fallback_kernel = F.pad(fallback_kernel, [pad_size]*4)
+                frac_kernel_weights = fallback_kernel
+            
+            # Set weights dynamically for the depthwise convolution layer
+            # Repeat weights for each input channel (group)
+            self.dw_frac.weight.data = frac_kernel_weights.repeat(self.cr, 1, 1, 1)
+            # Apply depthwise fractional laplacian
+            u1 = self.dw_frac(y) # Shape: (B, cr, H, W)
+            
+        except Exception as e:
+            print(f"Error in fractional Laplacian computation: {e}")
+            # 使用identity mapping作为fallback
+            u1 = y
+
+        # 检查u1的数值稳定性
+        if not torch.isfinite(u1).all():
+            print("Warning: Non-finite u1 in AFBPE")
+            u1 = torch.where(torch.isfinite(u1), u1, torch.zeros_like(u1))
 
         # --- Biharmonic Response (u2) ---
         # Apply cascaded fixed depthwise Laplacians
-        u2 = self.dw_lap2(self.dw_lap1(y)) # Shape: (B, cr, H, W)
+        try:
+            u2 = self.dw_lap2(self.dw_lap1(y)) # Shape: (B, cr, H, W)
+        except Exception as e:
+            print(f"Error in biharmonic computation: {e}")
+            u2 = y
+            
+        # 检查u2的数值稳定性  
+        if not torch.isfinite(u2).all():
+            print("Warning: Non-finite u2 in AFBPE")
+            u2 = torch.where(torch.isfinite(u2), u2, torch.zeros_like(u2))
 
         # --- Fusion ---
         # Concatenate along the channel dimension
         fused_response = torch.cat([u1, u2], dim=1) # Shape: (B, 2*cr, H, W)
+        
+        # 检查fusion前的数值
+        if not torch.isfinite(fused_response).all():
+            print("Warning: Non-finite fused_response in AFBPE")
+            fused_response = torch.where(torch.isfinite(fused_response), fused_response, torch.zeros_like(fused_response))
+            
         # Apply fusion block (1x1 Conv + BN + SiLU)
         a = self.fuse(fused_response) # Shape: (B, channels, H, W)
+        
+        # 检查attention map
+        if not torch.isfinite(a).all():
+            print("Warning: Non-finite attention map in AFBPE")
+            a = torch.where(torch.isfinite(a), a, torch.zeros_like(a))
 
         # --- Residual Modulation ---
-        # Calculate modulation factor (attention map)
-        modulation_factor = 1.0 + self.act(a) # Shape: (B, channels, H, W)
+        # Calculate modulation factor (attention map) with more conservative scaling
+        modulation_factor = 1.0 + 0.1 * self.act(a)  # 减小调制强度防止数值不稳定
+        
+        # 最终检查
+        if not torch.isfinite(modulation_factor).all():
+            print("Warning: Non-finite modulation_factor in AFBPE")
+            modulation_factor = torch.ones_like(modulation_factor)
+            
         # Apply modulation to the original input feature map x
         output = x * modulation_factor # Element-wise multiplication
+        
+        # 最终输出检查
+        if not torch.isfinite(output).all():
+            print("Warning: Non-finite output in AFBPE, returning input")
+            output = x
 
         return output
 
@@ -295,3 +382,54 @@ if __name__ == '__main__':
     total_params_k3, _, _, _ = afb_pe_module_k3.get_learnable_params()
     print(f"AFB-PE Module (k={kernel_size_3}) Output shape: {output_tensor_k3.shape}")
     print(f"AFB-PE Module (k={kernel_size_3}) Total Learnable Parameters: {total_params_k3}")
+
+# ------------- New AFBPEConv Module -------------
+from ultralytics.nn.modules.conv import Conv
+
+def autopad(k, p=None, d=1):
+    """Auto-padding calculation"""
+    if p is None:
+        p = (k - 1) // 2 * d
+    return p
+
+class AFBPEConv(nn.Module):
+    """
+    Convolutional layer combined with Adaptive Fractional Biharmonic Position Encoding.
+
+    Applies a standard convolution (Conv), followed by the AFBPE module.
+    The AFBPE module enhances feature representations by encoding fractional biharmonic
+    information, particularly useful for small target detection.
+
+    Args:
+        c1 (int): Number of input channels.
+        c2 (int): Number of output channels.
+        k (int): Kernel size for the convolution. Defaults to 1.
+        s (int): Stride for the convolution. Defaults to 1.
+        p (int, optional): Padding for the convolution. Defaults to None (autopad).
+        g (int): Number of groups for the convolution. Defaults to 1.
+        d (int): Dilation for the convolution. Defaults to 1.
+        act (bool | nn.Module): Activation function. Defaults to True (use default).
+        bias (bool): Whether to use bias in the convolution. Defaults to False.
+        afbpe_r (int): Channel reduction ratio for AFBPE. Defaults to 4.
+        afbpe_k (int): Kernel size for depthwise convolutions in AFBPE. Must be odd. Defaults to 5.
+    """
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True, 
+                 afbpe_r=4, afbpe_k=5):
+        super().__init__()
+        # Standard convolution layer
+        self.conv = Conv(c1, c2, k, s, p=p, g=g, d=d, act=act)
+        # AFBPE module applied on the output of the convolution (c2 channels)
+        self.afbpe = AFBPE(channels=c2, r=afbpe_r, k=afbpe_k)
+
+    def forward(self, x):
+        """Applies Conv -> AFBPE to the input tensor."""
+        y = self.conv(x)
+        return self.afbpe(y)
+
+    def forward_fuse(self, x):
+        """
+        Forward pass for fused model. 
+        Applies the fused Conv and then the AFBPE module.
+        """
+        y = self.conv.forward_fuse(x)
+        return self.afbpe(y)
