@@ -2,7 +2,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from .conv import Conv, autopad
+from ultralytics.nn.modules.conv import Conv
+
+def autopad(k, p=None, d=1):
+    """Auto-padding calculation"""
+    if p is None:
+        p = (k - 1) // 2 * d
+    return p
 
 class MSGRA(nn.Module):
     """
@@ -58,9 +64,6 @@ class MSGRA(nn.Module):
         return F.conv2d(x, weight, None, stride, padding, dilation, groups)
 
     def forward(self, x):
-        input_dtype = x.dtype
-        x = x.to(dtype=torch.float32)  # 确保计算精度
-        
         # x: B, C, H, W
         # Global average pooling
         gap = x.mean(dim=(2, 3), keepdim=True)  # B, C, 1, 1
@@ -92,7 +95,7 @@ class MSGRA(nn.Module):
         
         # Attention map
         attn = torch.sigmoid(radial_out)
-        return (x * (1 + attn)).to(input_dtype)  # 恢复原始数据类型
+        return x * (1 + attn)
 
 #--------------------------------------------------------------------------
 # 新增: MSGRAConv - 结合多尺度高斯径向注意力和标准卷积的模块
@@ -121,7 +124,6 @@ class MSGRAConv(nn.Module):
         g=1,                # 卷积分组数
         d=1,                # 卷积膨胀率
         act=True,           # 激活函数
-        bias=False,         # 是否使用偏置
         K=4,                # 径向核数量
         sigmas=(1.0, 2.0, 3.0, 4.0),  # 高斯核的sigma值
         attn_first=False    # 注意力在卷积前(True)还是卷积后(False)
@@ -138,7 +140,6 @@ class MSGRAConv(nn.Module):
             g (int): 分组卷积的组数
             d (int): 空洞卷积的膨胀率
             act (bool或nn.Module): 激活函数
-            bias (bool): 是否在卷积中使用偏置
             K (int): 径向核数量
             sigmas (tuple): 高斯核的sigma值列表，长度应等于K
             attn_first (bool): 是否先应用注意力再卷积
@@ -162,7 +163,6 @@ class MSGRAConv(nn.Module):
             p=p,
             g=g,
             d=d,
-            bias=bias,
             act=False  # 激活函数最后应用
         )
         
@@ -218,7 +218,6 @@ class MSGRAConv(nn.Module):
         """标准前向传播"""
         # 保存原始数据类型
         input_dtype = x.dtype
-        x = x.to(dtype=torch.float32)
         
         if self.attn_first:
             # 先应用注意力，再进行卷积
@@ -229,15 +228,11 @@ class MSGRAConv(nn.Module):
             x = self.conv(x)
             x = self.attn(x)
         
-        # 应用激活函数并恢复原始数据类型
-        return self.act(x).to(input_dtype)
+        # 应用激活函数
+        return self.act(x)
     
     def forward_fuse(self, x):
         """用于推理优化的融合前向传播"""
-        # 保存原始数据类型
-        input_dtype = x.dtype
-        x = x.to(dtype=torch.float32)
-        
         if self.attn_first:
             # 先应用注意力，再进行融合卷积
             x = self.attn(x)
@@ -247,8 +242,8 @@ class MSGRAConv(nn.Module):
             x = self.conv.forward_fuse(x)
             x = self.attn(x)
         
-        # 应用激活函数并恢复原始数据类型
-        return self.act(x).to(input_dtype)
+        # 应用激活函数
+        return self.act(x)
 
 
 # Example usage:
